@@ -88,6 +88,42 @@ This portfolio website was built entirely by Kanak himself using React, a custom
 The resume is view-only in the site (no download button) — visitors can read the full PDF in the Resume viewer, or
 contact Kanak directly for a copy.`;
 
+// Models are tried in order. If one is busy (503) or slow, the next one is used.
+const MODELS = ['gemini-3.5-flash', 'gemini-3.1-flash-lite'];
+
+async function callGemini(model, apiKey, question) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 9000); // give up on a slow model after 9s
+  try {
+    const r = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        signal: controller.signal,
+        body: JSON.stringify({
+          contents: [{ role: 'user', parts: [{ text: question }] }],
+          systemInstruction: { role: 'system', parts: [{ text: SYSTEM_CONTEXT }] },
+          generationConfig: { temperature: 0.4, maxOutputTokens: 1000 }
+        })
+      }
+    );
+    if (!r.ok) {
+      const detail = await r.text().catch(() => '');
+      return { ok: false, status: r.status, detail: detail.slice(0, 300) };
+    }
+    const data = await r.json();
+    const parts = data?.candidates?.[0]?.content?.parts || [];
+    const answer = parts.map(p => p.text || '').join('').trim();
+    if (!answer) return { ok: false, status: 502, detail: 'Empty response from model' };
+    return { ok: true, answer };
+  } catch (err) {
+    return { ok: false, status: 504, detail: err.name === 'AbortError' ? 'Model timed out' : 'Network error' };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 export default async function handler(req, res) {
   // Basic CORS so the frontend can call this from any deployed origin
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -112,31 +148,14 @@ export default async function handler(req, res) {
     return res.status(400).json({ error: 'Missing question' });
   }
 
-  try {
-    const geminiRes = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent?key=${apiKey}`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          contents: [{ role: 'user', parts: [{ text: question }] }],
-          systemInstruction: { role: 'system', parts: [{ text: SYSTEM_CONTEXT }] },
-          generationConfig: { temperature: 0.4, maxOutputTokens: 300 }
-        })
-      }
-    );
-
-    if (!geminiRes.ok) {
-      const errText = await geminiRes.text().catch(() => '');
-      return res.status(502).json({ error: 'Gemini API error', detail: errText.slice(0, 300) });
-    }
-
-    const data = await geminiRes.json();
-    const answer = data?.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
-    if (!answer) return res.status(502).json({ error: 'No response text from model' });
-
-    return res.status(200).json({ answer });
-  } catch (err) {
-    return res.status(500).json({ error: 'Failed to reach Gemini API' });
+  let last = null;
+  for (const model of MODELS) {
+    const result = await callGemini(model, apiKey, question.slice(0, 1000));
+    if (result.ok) return res.status(200).json({ answer: result.answer });
+    last = result;
+    // Bad key / bad request will not be fixed by another model, so stop early.
+    if (result.status === 400 || result.status === 401 || result.status === 403) break;
   }
+
+  return res.status(502).json({ error: 'Gemini API error', detail: last ? last.detail : 'Unknown error' });
 }
